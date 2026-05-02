@@ -143,15 +143,16 @@ Supported early operations:
 - `mark_blueprint_modified`
 - `refresh_blueprint_nodes`
 
-## Limitations
+## Current Boundaries
 
-BlueprintLens is a prototype:
+BlueprintLens now covers practical inspection, summary, validation, diffing, and controlled patch workflows, but it is not a complete Blueprint editor replacement:
 
-- It does not perfectly reconstruct the editor visual graph.
-- It does not export every hidden compiler-generated detail.
-- It does not fully model inherited Blueprint state.
-- It does not convert JSON back into `.uasset` files.
-- Write support is experimental and should be verified in-editor.
+- It exports semantic graph data, not a pixel-perfect reconstruction of the editor canvas.
+- Writer analysis is heuristic and based on node classes/titles, so exported results should guide review rather than replace in-editor verification.
+- It does not yet export every hidden compiler-generated detail, dispatcher, timeline, inherited Blueprint variable, widget tree detail, or component template property.
+- `BlueprintLensApply` intentionally applies small intent patches through Unreal editor APIs; it is not a general JSON-to-`.uasset` converter.
+- Patch support is useful but still scoped: branch/custom event/comment/function/variable nodes and pin operations are supported, while switch nodes, reroutes, component template editing, interface implementation, function signature editing, widget edits, and richer graph layout are still future work.
+- `-Validate` compiles exported Blueprints and records status, but deep gameplay correctness still needs normal Unreal/editor tests.
 - You must run the Unreal version that owns the project.
 
 ## Recommended Use
