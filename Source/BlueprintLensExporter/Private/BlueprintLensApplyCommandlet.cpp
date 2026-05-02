@@ -3,14 +3,17 @@
 #include "BlueprintEditorLibrary.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraph.h"
+#include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2_Actions.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
 #include "HAL/FileManager.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_IfThenElse.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -711,6 +714,112 @@ static bool ApplyAddCallFunction(const TSharedPtr<FJsonObject>& Operation, FAppl
     return true;
 }
 
+static bool ApplyAddCustomEvent(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    UEdGraph* Graph = nullptr;
+    UBlueprint* Blueprint = LoadBlueprintAndGraph(Operation, Graph, OutError);
+    if (!Blueprint)
+    {
+        return false;
+    }
+
+    FString Name;
+    FString Alias;
+    if (!ReadStringField(Operation, TEXT("name"), Name, OutError) ||
+        !ReadStringField(Operation, TEXT("alias"), Alias, OutError))
+    {
+        return false;
+    }
+
+    UK2Node_CustomEvent* Node = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_CustomEvent>(
+        Graph,
+        FVector2D(ReadNumberField(Operation, TEXT("x"), 0), ReadNumberField(Operation, TEXT("y"), 0)),
+        EK2NewNodeFlags::None,
+        [&Name](UK2Node_CustomEvent* NewNode)
+        {
+            NewNode->CustomFunctionName = *Name;
+        });
+
+    if (!Node)
+    {
+        OutError = FString::Printf(TEXT("Failed to spawn custom event '%s'."), *Name);
+        return false;
+    }
+
+    Context.NodeAliases.Add(Alias, Node);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
+static bool ApplyAddBranch(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    UEdGraph* Graph = nullptr;
+    UBlueprint* Blueprint = LoadBlueprintAndGraph(Operation, Graph, OutError);
+    if (!Blueprint)
+    {
+        return false;
+    }
+
+    FString Alias;
+    if (!ReadStringField(Operation, TEXT("alias"), Alias, OutError))
+    {
+        return false;
+    }
+
+    UK2Node_IfThenElse* Node = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_IfThenElse>(
+        Graph,
+        FVector2D(ReadNumberField(Operation, TEXT("x"), 0), ReadNumberField(Operation, TEXT("y"), 0)),
+        EK2NewNodeFlags::None);
+
+    if (!Node)
+    {
+        OutError = TEXT("Failed to spawn branch node.");
+        return false;
+    }
+
+    Context.NodeAliases.Add(Alias, Node);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
+static bool ApplyAddComment(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    UEdGraph* Graph = nullptr;
+    UBlueprint* Blueprint = LoadBlueprintAndGraph(Operation, Graph, OutError);
+    if (!Blueprint)
+    {
+        return false;
+    }
+
+    FString Text;
+    FString Alias;
+    if (!ReadStringField(Operation, TEXT("text"), Text, OutError) ||
+        !ReadStringField(Operation, TEXT("alias"), Alias, OutError))
+    {
+        return false;
+    }
+
+    Graph->Modify();
+    UEdGraphNode_Comment* Node = NewObject<UEdGraphNode_Comment>(Graph);
+    if (!Node)
+    {
+        OutError = TEXT("Failed to create comment node.");
+        return false;
+    }
+
+    Node->NodePosX = static_cast<int32>(ReadNumberField(Operation, TEXT("x"), 0));
+    Node->NodePosY = static_cast<int32>(ReadNumberField(Operation, TEXT("y"), 0));
+    Node->NodeWidth = static_cast<int32>(ReadNumberField(Operation, TEXT("width"), 400));
+    Node->NodeHeight = static_cast<int32>(ReadNumberField(Operation, TEXT("height"), 200));
+    Node->NodeComment = Text;
+    Graph->AddNode(Node, true, false);
+    Graph->NotifyGraphChanged();
+
+    Context.NodeAliases.Add(Alias, Node);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
 static bool ApplySetPinDefault(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
 {
     FString NodeAlias;
@@ -960,6 +1069,18 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
         else if (Op == TEXT("add_call_function"))
         {
             bSuccess = BlueprintLensApply::ApplyAddCallFunction(Operation, Context, Error);
+        }
+        else if (Op == TEXT("add_custom_event"))
+        {
+            bSuccess = BlueprintLensApply::ApplyAddCustomEvent(Operation, Context, Error);
+        }
+        else if (Op == TEXT("add_branch"))
+        {
+            bSuccess = BlueprintLensApply::ApplyAddBranch(Operation, Context, Error);
+        }
+        else if (Op == TEXT("add_comment"))
+        {
+            bSuccess = BlueprintLensApply::ApplyAddComment(Operation, Context, Error);
         }
         else if (Op == TEXT("set_pin_default"))
         {

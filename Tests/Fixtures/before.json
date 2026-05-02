@@ -1,0 +1,29 @@
+{
+  "schema": "blueprint-lens.v1",
+  "project": "FixtureProject",
+  "path": "/Game",
+  "assetCount": 1,
+  "skippedUnsupportedAssetCount": 0,
+  "assets": [
+    {
+      "name": "BP_Test",
+      "objectPath": "/Game/BP_Test.BP_Test",
+      "packageName": "/Game/BP_Test",
+      "parentClass": "/Script/Engine.Actor",
+      "graphs": [
+        {
+          "name": "EventGraph",
+          "kind": "ubergraph",
+          "nodes": [
+            {
+              "guid": "11111111-1111-1111-1111-111111111111",
+              "stableAlias": "eventgraph.000_event_beginplay",
+              "title": "Event BeginPlay",
+              "pins": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
