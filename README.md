@@ -15,7 +15,12 @@ Raw `.uasset` files are binary and engine-version-sensitive. Instead of trying t
 - nodes
 - pins
 - pin links
+- stable node aliases
+- graph and asset summaries
+- writer-oriented analysis for variable writes, timers, material parameter writes, interface messages, and latent actions
 - dependencies
+
+The exporter can also write a compact Markdown summary from the same scan for quick model review.
 
 ## Install
 
@@ -54,6 +59,50 @@ Scan one asset:
   -unattended -nop4 -nosplash
 ```
 
+Export JSON and a compact Markdown summary together:
+
+```powershell
+& "C:\Program Files\Epic Games\UE_5.6\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+  "C:\Path\To\YourProject.uproject" `
+  -run=BlueprintLens `
+  -Path=/Game `
+  -Out="C:\Path\To\YourProject\Saved\BlueprintLens\game.json" `
+  -MarkdownOut="C:\Path\To\YourProject\Saved\BlueprintLens\game.md" `
+  -unattended -nop4 -nosplash
+```
+
+Compile each exported Blueprint and include validation results in the JSON:
+
+```powershell
+& "C:\Program Files\Epic Games\UE_5.6\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+  "C:\Path\To\YourProject.uproject" `
+  -run=BlueprintLens `
+  -Path=/Game `
+  -Out="C:\Path\To\YourProject\Saved\BlueprintLens\game.json" `
+  -Validate `
+  -unattended -nop4 -nosplash
+```
+
+Use the CI-friendly wrapper:
+
+```powershell
+.\Scripts\Export-BlueprintLens.ps1 `
+  -Project "C:\Path\To\YourProject.uproject" `
+  -UnrealEditorCmd "C:\Program Files\Epic Games\UE_5.6\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+  -Path /Game
+```
+
+Compare two exports:
+
+```powershell
+.\Scripts\Compare-BlueprintLensExport.ps1 `
+  -Base "Saved\BlueprintLens\before.json" `
+  -Head "Saved\BlueprintLens\after.json" `
+  -Out "Saved\BlueprintLens\diff.md"
+```
+
+See `Docs\blueprint-lens-schema.md` for the export shape.
+
 ## Apply Experimental Patches
 
 BlueprintLensApply accepts an intent patch and applies it through Unreal editor APIs:
@@ -84,11 +133,15 @@ Supported early operations:
 - `add_variable_get`
 - `add_variable_set`
 - `add_call_function`
+- `add_custom_event`
+- `add_branch`
+- `add_comment`
 - `set_pin_default`
 - `connect_pins`
 - `disconnect_pin`
 - `delete_node`
 - `mark_blueprint_modified`
+- `refresh_blueprint_nodes`
 
 ## Limitations
 
@@ -108,6 +161,7 @@ Use BlueprintLens to:
 - scan projects before AI work starts
 - inspect Blueprint structure
 - search for stale nodes or conflicting writers
+- review graph-level changes with export diffs
 - produce reviewable context for Copilot/Codex
 - author small controlled patches through Unreal APIs
 
