@@ -4,6 +4,17 @@ BlueprintLens is an Unreal Engine editor plugin that exports Blueprint assets to
 
 It was built to help AI coding agents inspect Blueprint-heavy projects without relying on screenshots or manually pasted node snippets.
 
+## What It Can Do
+
+- Export Blueprint assets to precise JSON for search, review, and agent reasoning.
+- Export compact Markdown summaries with `-MarkdownOut=<path>` when a quick human/model skim is more useful than raw JSON.
+- Add stable node aliases, graph summaries, asset summaries, interface metadata, and writer-oriented analysis to exports.
+- Detect likely variable reads/writes, function calls, timer calls, material parameter writes, interface messages, and latent actions.
+- Validate exports with `-Validate`, compiling each exported Blueprint and recording per-asset results.
+- Compare two BlueprintLens JSON exports with `Scripts\Compare-BlueprintLensExport.ps1`.
+- Run repeatable local or CI scans with `Scripts\Export-BlueprintLens.ps1`.
+- Apply controlled Blueprint edits through `BlueprintLensApply`, including variables, function graphs, function calls, variable get/set nodes, custom events, branch nodes, comments, pin defaults, pin wiring, disconnection, node deletion, refresh, compile, and save.
+
 ## Why It Exists
 
 Raw `.uasset` files are binary and engine-version-sensitive. Instead of trying to parse them directly, BlueprintLens runs inside Unreal, loads Blueprint assets through the editor/runtime APIs, and exports semantic information:
