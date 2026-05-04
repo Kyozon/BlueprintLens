@@ -33,6 +33,20 @@ The export is JSON-first. Optional Markdown output is generated from the same in
 - `analysis`: asset-level graph analysis aggregated from graphs.
 - `dependencies`: Asset Registry package dependencies.
 
+## Variable
+
+- `name`: member variable name.
+- `type`: compact pin type string.
+- `category`: Blueprint editor category.
+- `guid`: Blueprint variable GUID.
+- `defaultValue`: default value exported from the generated class default object when available.
+- `enum`: enum asset path for enum-backed variables.
+- `enumValues`: enum entries with `name`, `authoredName`, `value`, and `displayName`.
+- `propertyFlagsHex`: generated `FProperty` flags as a hex string when available.
+- `replicated`: whether the generated property has `CPF_Net`.
+- `repNotify`: whether the generated property has a RepNotify function.
+- `repNotifyFunction`: RepNotify function name when present.
+
 ## Graph
 
 - `name`: graph object name.

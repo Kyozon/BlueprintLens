@@ -939,6 +939,72 @@ static bool ApplyDeleteNode(const TSharedPtr<FJsonObject>& Operation, FApplyCont
     return true;
 }
 
+static bool ApplyDeleteGraph(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString GraphName;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("graph"), GraphName, OutError))
+    {
+        return false;
+    }
+
+    UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+    if (!Blueprint)
+    {
+        OutError = FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath);
+        return false;
+    }
+
+    UEdGraph* Graph = FindGraph(Blueprint, GraphName);
+    if (!Graph)
+    {
+        OutError = FString::Printf(TEXT("Could not find graph '%s' in '%s'."), *GraphName, *AssetPath);
+        return false;
+    }
+
+    if (Blueprint->UbergraphPages.Contains(Graph))
+    {
+        OutError = FString::Printf(TEXT("Refusing to delete ubergraph '%s' from '%s'. Delete nodes instead."), *GraphName, *AssetPath);
+        return false;
+    }
+
+    Blueprint->Modify();
+    Graph->Modify();
+    FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::MarkTransient);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
+static bool ApplyDeleteVariable(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString Name;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("name"), Name, OutError))
+    {
+        return false;
+    }
+
+    UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+    if (!Blueprint)
+    {
+        OutError = FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath);
+        return false;
+    }
+
+    if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *Name) == INDEX_NONE)
+    {
+        OutError = FString::Printf(TEXT("Could not find member variable '%s' in '%s'."), *Name, *AssetPath);
+        return false;
+    }
+
+    Blueprint->Modify();
+    FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, *Name);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
 static bool ApplyMarkBlueprintModified(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
 {
     FString AssetPath;
@@ -1097,6 +1163,14 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
         else if (Op == TEXT("delete_node"))
         {
             bSuccess = BlueprintLensApply::ApplyDeleteNode(Operation, Context, Error);
+        }
+        else if (Op == TEXT("delete_graph"))
+        {
+            bSuccess = BlueprintLensApply::ApplyDeleteGraph(Operation, Context, Error);
+        }
+        else if (Op == TEXT("delete_variable"))
+        {
+            bSuccess = BlueprintLensApply::ApplyDeleteVariable(Operation, Context, Error);
         }
         else if (Op == TEXT("mark_blueprint_modified"))
         {

@@ -10,6 +10,8 @@ Raw `.uasset` files are binary and engine-version-sensitive. Instead of trying t
 
 - Blueprint identity and parent/generated classes
 - member variables and defaults
+- enum-backed variable entry names and actual numeric values
+- variable property flags, replication state, and RepNotify functions
 - components from the Simple Construction Script
 - graphs
 - nodes
@@ -140,6 +142,8 @@ Supported early operations:
 - `connect_pins`
 - `disconnect_pin`
 - `delete_node`
+- `delete_graph`
+- `delete_variable`
 - `mark_blueprint_modified`
 - `refresh_blueprint_nodes`
 

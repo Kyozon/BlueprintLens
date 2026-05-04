@@ -519,6 +519,29 @@ static FString ExportVariableDefaultValue(const UBlueprint* Blueprint, const FBP
     return Variable.DefaultValue;
 }
 
+static void ExportVariableEnumValues(const FEdGraphPinType& PinType, TSharedPtr<FJsonObject> VariableJson)
+{
+    const UEnum* Enum = Cast<UEnum>(PinType.PinSubCategoryObject.Get());
+    if (!Enum)
+    {
+        return;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> EnumValues;
+    for (int32 Index = 0; Index < Enum->NumEnums(); ++Index)
+    {
+        TSharedPtr<FJsonObject> EntryJson = MakeShared<FJsonObject>();
+        EntryJson->SetStringField(TEXT("name"), Enum->GetNameStringByIndex(Index));
+        EntryJson->SetStringField(TEXT("authoredName"), Enum->GetAuthoredNameStringByIndex(Index));
+        EntryJson->SetNumberField(TEXT("value"), Enum->GetValueByIndex(Index));
+        EntryJson->SetStringField(TEXT("displayName"), Enum->GetDisplayNameTextByIndex(Index).ToString());
+        EnumValues.Add(MakeShared<FJsonValueObject>(EntryJson));
+    }
+
+    VariableJson->SetStringField(TEXT("enum"), Enum->GetPathName());
+    VariableJson->SetArrayField(TEXT("enumValues"), EnumValues);
+}
+
 static TSharedPtr<FJsonObject> ExportVariable(const UBlueprint* Blueprint, const FBPVariableDescription& Variable)
 {
     TSharedPtr<FJsonObject> VariableJson = MakeShared<FJsonObject>();
@@ -527,6 +550,23 @@ static TSharedPtr<FJsonObject> ExportVariable(const UBlueprint* Blueprint, const
     VariableJson->SetStringField(TEXT("category"), Variable.Category.ToString());
     VariableJson->SetStringField(TEXT("guid"), Variable.VarGuid.ToString(EGuidFormats::DigitsWithHyphensLower));
     VariableJson->SetStringField(TEXT("defaultValue"), ExportVariableDefaultValue(Blueprint, Variable));
+    ExportVariableEnumValues(Variable.VarType, VariableJson);
+
+    if (Blueprint && Blueprint->GeneratedClass)
+    {
+        if (const FProperty* Property = FindFProperty<FProperty>(Blueprint->GeneratedClass, Variable.VarName))
+        {
+            const uint64 PropertyFlags = Property->GetPropertyFlags();
+            VariableJson->SetStringField(TEXT("propertyFlagsHex"), FString::Printf(TEXT("0x%016llX"), static_cast<unsigned long long>(PropertyFlags)));
+            VariableJson->SetBoolField(TEXT("replicated"), (PropertyFlags & CPF_Net) != 0);
+            VariableJson->SetBoolField(TEXT("repNotify"), !Property->RepNotifyFunc.IsNone());
+            if (!Property->RepNotifyFunc.IsNone())
+            {
+                VariableJson->SetStringField(TEXT("repNotifyFunction"), Property->RepNotifyFunc.ToString());
+            }
+        }
+    }
+
     return VariableJson;
 }
 
