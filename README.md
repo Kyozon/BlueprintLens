@@ -61,6 +61,18 @@ Scan one asset:
   -unattended -nop4 -nosplash
 ```
 
+Scan several exact assets without a recursive asset-registry pass:
+
+```powershell
+& "C:\Program Files\Epic Games\UE_5.6\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+  "C:\Path\To\YourProject.uproject" `
+  -run=BlueprintLens `
+  -Assets="/Game/UI/W_MyWidget;/Game/Actors/BP_MyActor" `
+  -Out="C:\Path\To\YourProject\Saved\BlueprintLens\selected.json" `
+  -MarkdownOut="C:\Path\To\YourProject\Saved\BlueprintLens\selected.md" `
+  -unattended -nop4 -nosplash
+```
+
 Export JSON and a compact Markdown summary together:
 
 ```powershell
@@ -122,15 +134,23 @@ Patch skeleton:
 ```json
 {
   "schema": "blueprint-lens-patch.v1",
+  "compile": true,
+  "save": true,
   "operations": []
 }
 ```
 
+By default, `BlueprintLensApply` compiles and saves modified packages once after all operations have run. Use root-level `"compile": false` / `"save": false`, or command-line `-NoCompile` / `-NoSave`, when composing a larger editor-side pipeline.
+
 Supported early operations:
 
 - `create_blueprint`
+- `duplicate_asset`
 - `add_variable`
 - `add_function_graph`
+- `set_blueprint_cdo_property`
+- `add_game_feature_component_entry`
+- `replace_widget_child`
 - `alias_node`
 - `add_variable_get`
 - `add_variable_set`
@@ -155,7 +175,7 @@ BlueprintLens now covers practical inspection, summary, validation, diffing, and
 - Writer analysis is heuristic and based on node classes/titles, so exported results should guide review rather than replace in-editor verification.
 - It does not yet export every hidden compiler-generated detail, dispatcher, timeline, inherited Blueprint variable, widget tree detail, or component template property.
 - `BlueprintLensApply` intentionally applies small intent patches through Unreal editor APIs; it is not a general JSON-to-`.uasset` converter.
-- Patch support is useful but still scoped: branch/custom event/comment/function/variable nodes and pin operations are supported, while switch nodes, reroutes, component template editing, interface implementation, function signature editing, widget edits, and richer graph layout are still future work.
+- Patch support is useful but still scoped: branch/custom event/comment/function/variable nodes, pin operations, asset duplication, selected Blueprint default edits, Game Feature component entries, and selected Widget Blueprint child replacements are supported, while switch nodes, reroutes, component template editing, interface implementation, function signature editing, and richer graph layout are still future work.
 - `-Validate` compiles exported Blueprints and records status, but deep gameplay correctness still needs normal Unreal/editor tests.
 - You must run the Unreal version that owns the project.
 

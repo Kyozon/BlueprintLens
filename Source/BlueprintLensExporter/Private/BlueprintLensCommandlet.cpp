@@ -11,6 +11,9 @@
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "HAL/FileManager.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/PanelSlot.h"
+#include "Components/Widget.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
@@ -21,6 +24,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/UnrealType.h"
+#include "WidgetBlueprint.h"
 
 namespace BlueprintLens
 {
@@ -31,6 +35,53 @@ static FString GetAssetClassName(const FAssetData& AssetData)
 #else
     return AssetData.AssetClass.ToString();
 #endif
+}
+
+static void ParseAssetList(const FString& AssetListText, TArray<FString>& OutAssets)
+{
+    TArray<FString> Parts;
+    AssetListText.ParseIntoArray(Parts, TEXT(","), true);
+    if (Parts.Num() <= 1)
+    {
+        Parts.Reset();
+        AssetListText.ParseIntoArray(Parts, TEXT(";"), true);
+    }
+
+    for (FString Part : Parts)
+    {
+        Part.TrimStartAndEndInline();
+        if (!Part.IsEmpty())
+        {
+            OutAssets.Add(Part);
+        }
+    }
+}
+
+static FString ToPackageName(FString AssetPath)
+{
+    int32 ObjectDelimiterIndex = INDEX_NONE;
+    if (AssetPath.FindChar(TEXT('.'), ObjectDelimiterIndex))
+    {
+        AssetPath = AssetPath.Left(ObjectDelimiterIndex);
+    }
+    return AssetPath;
+}
+
+static FString ToObjectPath(const FString& AssetPath)
+{
+    if (AssetPath.Contains(TEXT(".")))
+    {
+        return AssetPath;
+    }
+
+    FString PackagePath;
+    FString AssetName;
+    if (!AssetPath.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+    {
+        return AssetPath;
+    }
+
+    return AssetPath + TEXT(".") + AssetName;
 }
 
 static bool IsSourceBlueprintAssetClass(const FString& AssetClass)
@@ -586,6 +637,211 @@ static TSharedPtr<FJsonObject> ExportComponent(USCS_Node* Node, UBlueprintGenera
     return ComponentJson;
 }
 
+static bool ShouldExportClassDefaultProperty(const FProperty* Property)
+{
+    if (!Property)
+    {
+        return false;
+    }
+
+    const uint64 ExportableFlags = CPF_Edit | CPF_BlueprintVisible;
+    const uint64 ExcludedFlags = CPF_Parm | CPF_ReturnParm | CPF_Transient | CPF_Deprecated;
+
+    if (!Property->HasAnyPropertyFlags(ExportableFlags) || Property->HasAnyPropertyFlags(ExcludedFlags))
+    {
+        return false;
+    }
+
+    return !Property->IsA<FDelegateProperty>() && !Property->IsA<FMulticastDelegateProperty>();
+}
+
+static FString ExportPropertyDefaultValue(const FProperty* Property, const UObject* DefaultObject)
+{
+    if (!Property || !DefaultObject)
+    {
+        return FString();
+    }
+
+    FString Value;
+    Property->ExportText_InContainer(0, Value, DefaultObject, DefaultObject, nullptr, PPF_None);
+    return Value;
+}
+
+static TSharedPtr<FJsonObject> ExportClassDefaultProperty(const FProperty* Property, const UObject* DefaultObject)
+{
+    TSharedPtr<FJsonObject> PropertyJson = MakeShared<FJsonObject>();
+    PropertyJson->SetStringField(TEXT("name"), Property->GetName());
+    PropertyJson->SetStringField(TEXT("type"), Property->GetCPPType(nullptr, CPPF_None));
+    PropertyJson->SetStringField(TEXT("ownerClass"), Property->GetOwnerClass() ? Property->GetOwnerClass()->GetPathName() : FString());
+    PropertyJson->SetStringField(TEXT("defaultValue"), ExportPropertyDefaultValue(Property, DefaultObject));
+
+    const uint64 PropertyFlags = Property->GetPropertyFlags();
+    PropertyJson->SetStringField(TEXT("propertyFlagsHex"), FString::Printf(TEXT("0x%016llX"), static_cast<unsigned long long>(PropertyFlags)));
+
+    if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("objectClass"), ObjectProperty->PropertyClass ? ObjectProperty->PropertyClass->GetPathName() : FString());
+    }
+    else if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("structType"), StructProperty->Struct ? StructProperty->Struct->GetPathName() : FString());
+    }
+    else if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("enumType"), EnumProperty->GetEnum() ? EnumProperty->GetEnum()->GetPathName() : FString());
+    }
+    else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property))
+    {
+        if (ByteProperty->GetIntPropertyEnum())
+        {
+            PropertyJson->SetStringField(TEXT("enumType"), ByteProperty->GetIntPropertyEnum()->GetPathName());
+        }
+    }
+
+    return PropertyJson;
+}
+
+static void ExportClassDefaults(const UBlueprint* Blueprint, TSharedPtr<FJsonObject> AssetJson)
+{
+    if (!Blueprint || !Blueprint->GeneratedClass || !AssetJson.IsValid())
+    {
+        return;
+    }
+
+    const UObject* DefaultObject = Blueprint->GeneratedClass->GetDefaultObject(false);
+    if (!DefaultObject)
+    {
+        return;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> ClassDefaults;
+    for (TFieldIterator<FProperty> PropertyIt(Blueprint->GeneratedClass, EFieldIterationFlags::IncludeSuper); PropertyIt; ++PropertyIt)
+    {
+        const FProperty* Property = *PropertyIt;
+        if (!ShouldExportClassDefaultProperty(Property))
+        {
+            continue;
+        }
+
+        ClassDefaults.Add(MakeShared<FJsonValueObject>(ExportClassDefaultProperty(Property, DefaultObject)));
+    }
+
+    AssetJson->SetArrayField(TEXT("classDefaults"), ClassDefaults);
+}
+
+static bool HasPropertyOverride(const FProperty* Property, const UObject* InstanceObject, const UObject* DefaultObject)
+{
+    return Property && InstanceObject && DefaultObject && !Property->Identical_InContainer(InstanceObject, DefaultObject, PPF_None);
+}
+
+static TSharedPtr<FJsonObject> ExportObjectProperty(const FProperty* Property, const UObject* SourceObject)
+{
+    TSharedPtr<FJsonObject> PropertyJson = MakeShared<FJsonObject>();
+    PropertyJson->SetStringField(TEXT("name"), Property->GetName());
+    PropertyJson->SetStringField(TEXT("type"), Property->GetCPPType(nullptr, CPPF_None));
+    PropertyJson->SetStringField(TEXT("ownerClass"), Property->GetOwnerClass() ? Property->GetOwnerClass()->GetPathName() : FString());
+    PropertyJson->SetStringField(TEXT("defaultValue"), ExportPropertyDefaultValue(Property, SourceObject));
+
+    const uint64 PropertyFlags = Property->GetPropertyFlags();
+    PropertyJson->SetStringField(TEXT("propertyFlagsHex"), FString::Printf(TEXT("0x%016llX"), static_cast<unsigned long long>(PropertyFlags)));
+
+    if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("objectClass"), ObjectProperty->PropertyClass ? ObjectProperty->PropertyClass->GetPathName() : FString());
+    }
+    else if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("structType"), StructProperty->Struct ? StructProperty->Struct->GetPathName() : FString());
+    }
+    else if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+    {
+        PropertyJson->SetStringField(TEXT("enumType"), EnumProperty->GetEnum() ? EnumProperty->GetEnum()->GetPathName() : FString());
+    }
+    else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property))
+    {
+        if (ByteProperty->GetIntPropertyEnum())
+        {
+            PropertyJson->SetStringField(TEXT("enumType"), ByteProperty->GetIntPropertyEnum()->GetPathName());
+        }
+    }
+
+    return PropertyJson;
+}
+
+static void ExportObjectPropertyOverrides(const UObject* SourceObject, TArray<TSharedPtr<FJsonValue>>& OutProperties)
+{
+    if (!SourceObject)
+    {
+        return;
+    }
+
+    const UObject* DefaultObject = SourceObject->GetClass()->GetDefaultObject(false);
+    if (!DefaultObject)
+    {
+        return;
+    }
+
+    for (TFieldIterator<FProperty> PropertyIt(SourceObject->GetClass(), EFieldIterationFlags::IncludeSuper); PropertyIt; ++PropertyIt)
+    {
+        const FProperty* Property = *PropertyIt;
+        if (!ShouldExportClassDefaultProperty(Property) || !HasPropertyOverride(Property, SourceObject, DefaultObject))
+        {
+            continue;
+        }
+
+        OutProperties.Add(MakeShared<FJsonValueObject>(ExportObjectProperty(Property, SourceObject)));
+    }
+}
+
+static TSharedPtr<FJsonObject> ExportWidgetTreeEntry(const UWidget* Widget)
+{
+    TSharedPtr<FJsonObject> WidgetJson = MakeShared<FJsonObject>();
+    WidgetJson->SetStringField(TEXT("name"), Widget->GetName());
+    WidgetJson->SetStringField(TEXT("class"), Widget->GetClass()->GetPathName());
+    WidgetJson->SetStringField(TEXT("parent"), Widget->GetParent() ? Widget->GetParent()->GetName() : FString());
+    WidgetJson->SetStringField(TEXT("parentClass"), Widget->GetParent() ? Widget->GetParent()->GetClass()->GetPathName() : FString());
+
+    TArray<TSharedPtr<FJsonValue>> Properties;
+    ExportObjectPropertyOverrides(Widget, Properties);
+    WidgetJson->SetArrayField(TEXT("properties"), Properties);
+
+    if (const UPanelSlot* Slot = Widget->Slot)
+    {
+        WidgetJson->SetStringField(TEXT("slotClass"), Slot->GetClass()->GetPathName());
+
+        TArray<TSharedPtr<FJsonValue>> SlotProperties;
+        ExportObjectPropertyOverrides(Slot, SlotProperties);
+        WidgetJson->SetArrayField(TEXT("slotProperties"), SlotProperties);
+    }
+
+    return WidgetJson;
+}
+
+static void ExportWidgetTree(const UBlueprint* Blueprint, TSharedPtr<FJsonObject> AssetJson)
+{
+    const UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(Blueprint);
+    if (!WidgetBlueprint || !WidgetBlueprint->WidgetTree || !AssetJson.IsValid())
+    {
+        return;
+    }
+
+    TArray<UWidget*> Widgets;
+    WidgetBlueprint->WidgetTree->GetAllWidgets(Widgets);
+
+    TArray<TSharedPtr<FJsonValue>> WidgetTree;
+    for (const UWidget* Widget : Widgets)
+    {
+        if (!Widget)
+        {
+            continue;
+        }
+
+        WidgetTree.Add(MakeShared<FJsonValueObject>(ExportWidgetTreeEntry(Widget)));
+    }
+
+    AssetJson->SetArrayField(TEXT("widgetTree"), WidgetTree);
+}
+
 static void AddPackageDependencies(FAssetRegistryModule& AssetRegistryModule, const FName PackageName, TSharedPtr<FJsonObject> AssetJson)
 {
     TArray<FName> Dependencies;
@@ -631,6 +887,9 @@ static TSharedPtr<FJsonObject> ExportBlueprint(UBlueprint* Blueprint, const FAss
         }
     }
     AssetJson->SetArrayField(TEXT("components"), Components);
+
+    ExportClassDefaults(Blueprint, AssetJson);
+    ExportWidgetTree(Blueprint, AssetJson);
 
     TArray<TSharedPtr<FJsonValue>> Interfaces;
     for (const FBPInterfaceDescription& Interface : Blueprint->ImplementedInterfaces)
@@ -739,6 +998,30 @@ static void AppendMarkdownStringArray(FString& Output, const TSharedPtr<FJsonObj
     }
 }
 
+static void AppendMarkdownPropertyArray(FString& Output, const TSharedPtr<FJsonObject>& Object, const FString& FieldName)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Properties = nullptr;
+    if (!Object.IsValid() || !Object->TryGetArrayField(FieldName, Properties) || !Properties)
+    {
+        return;
+    }
+
+    for (const TSharedPtr<FJsonValue>& PropertyValue : *Properties)
+    {
+        const TSharedPtr<FJsonObject> Property = PropertyValue.IsValid() ? PropertyValue->AsObject() : nullptr;
+        if (!Property.IsValid())
+        {
+            continue;
+        }
+
+        AppendMarkdownLine(Output, FString::Printf(
+            TEXT("  - %s: %s, default %s"),
+            *MarkdownInlineCode(GetJsonString(Property, TEXT("name"))),
+            *MarkdownInlineCode(GetJsonString(Property, TEXT("type"))),
+            *MarkdownInlineCode(GetJsonString(Property, TEXT("defaultValue")))));
+    }
+}
+
 static void AppendMarkdownBlueprint(FString& Output, const TSharedPtr<FJsonObject>& Asset)
 {
     if (!Asset.IsValid())
@@ -813,6 +1096,51 @@ static void AppendMarkdownBlueprint(FString& Output, const TSharedPtr<FJsonObjec
                     *MarkdownInlineCode(GetJsonString(Component, TEXT("variableName"))),
                     *MarkdownInlineCode(GetJsonString(Component, TEXT("componentClass")))));
             }
+        }
+    }
+    AppendMarkdownLine(Output);
+
+    const TArray<TSharedPtr<FJsonValue>>* ClassDefaults = nullptr;
+    AppendMarkdownLine(Output, FString::Printf(TEXT("### Class Defaults (%d)"), GetJsonArrayCount(Asset, TEXT("classDefaults"))));
+    if (Asset->TryGetArrayField(TEXT("classDefaults"), ClassDefaults) && ClassDefaults)
+    {
+        for (const TSharedPtr<FJsonValue>& PropertyValue : *ClassDefaults)
+        {
+            const TSharedPtr<FJsonObject> Property = PropertyValue.IsValid() ? PropertyValue->AsObject() : nullptr;
+            if (Property.IsValid())
+            {
+                AppendMarkdownLine(Output, FString::Printf(
+                    TEXT("- %s: %s, default %s"),
+                    *MarkdownInlineCode(GetJsonString(Property, TEXT("name"))),
+                    *MarkdownInlineCode(GetJsonString(Property, TEXT("type"))),
+                    *MarkdownInlineCode(GetJsonString(Property, TEXT("defaultValue")))));
+            }
+        }
+    }
+    AppendMarkdownLine(Output);
+
+    const TArray<TSharedPtr<FJsonValue>>* WidgetTree = nullptr;
+    AppendMarkdownLine(Output, FString::Printf(TEXT("### Widget Tree (%d)"), GetJsonArrayCount(Asset, TEXT("widgetTree"))));
+    if (Asset->TryGetArrayField(TEXT("widgetTree"), WidgetTree) && WidgetTree)
+    {
+        for (const TSharedPtr<FJsonValue>& WidgetValue : *WidgetTree)
+        {
+            const TSharedPtr<FJsonObject> Widget = WidgetValue.IsValid() ? WidgetValue->AsObject() : nullptr;
+            if (!Widget.IsValid())
+            {
+                continue;
+            }
+
+            AppendMarkdownLine(Output, FString::Printf(
+                TEXT("- %s: %s, parent %s, %d properties, %d slot properties"),
+                *MarkdownInlineCode(GetJsonString(Widget, TEXT("name"))),
+                *MarkdownInlineCode(GetJsonString(Widget, TEXT("class"))),
+                *MarkdownInlineCode(GetJsonString(Widget, TEXT("parent"))),
+                GetJsonArrayCount(Widget, TEXT("properties")),
+                GetJsonArrayCount(Widget, TEXT("slotProperties"))));
+
+            AppendMarkdownPropertyArray(Output, Widget, TEXT("properties"));
+            AppendMarkdownPropertyArray(Output, Widget, TEXT("slotProperties"));
         }
     }
     AppendMarkdownLine(Output);
@@ -913,23 +1241,62 @@ int32 UBlueprintLensCommandlet::Main(const FString& Params)
     FString OutPath = FPaths::ProjectSavedDir() / TEXT("BlueprintLens/blueprints.json");
     FString MarkdownOutPath;
     FString SingleAsset;
+    FString MultipleAssets;
     const bool bValidate = FParse::Param(*Params, TEXT("Validate"));
 
     FParse::Value(*Params, TEXT("Path="), RootPath);
     FParse::Value(*Params, TEXT("Out="), OutPath);
     FParse::Value(*Params, TEXT("MarkdownOut="), MarkdownOutPath);
     FParse::Value(*Params, TEXT("Asset="), SingleAsset);
+    FParse::Value(*Params, TEXT("Assets="), MultipleAssets);
+
+    TArray<FString> ExactAssets;
+    if (!SingleAsset.IsEmpty())
+    {
+        ExactAssets.Add(SingleAsset);
+    }
+    if (!MultipleAssets.IsEmpty())
+    {
+        BlueprintLens::ParseAssetList(MultipleAssets, ExactAssets);
+    }
 
     FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
     IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
-    AssetRegistry.SearchAllAssets(true);
+    if (ExactAssets.Num() == 0)
+    {
+        AssetRegistry.SearchAllAssets(true);
+    }
 
     FARFilter Filter;
     Filter.bRecursivePaths = true;
-    Filter.PackagePaths.Add(*RootPath);
+    if (ExactAssets.Num() == 0)
+    {
+        Filter.PackagePaths.Add(*RootPath);
+    }
+    else
+    {
+        Filter.bRecursivePaths = false;
+        for (const FString& ExactAsset : ExactAssets)
+        {
+            Filter.PackageNames.Add(*BlueprintLens::ToPackageName(ExactAsset));
+        }
+    }
 
     TArray<FAssetData> Assets;
-    AssetRegistry.GetAssets(Filter, Assets);
+    if (ExactAssets.Num() == 0)
+    {
+        AssetRegistry.GetAssets(Filter, Assets);
+    }
+    else
+    {
+        for (const FString& ExactAsset : ExactAssets)
+        {
+            if (UObject* LoadedAsset = LoadObject<UObject>(nullptr, *BlueprintLens::ToObjectPath(ExactAsset)))
+            {
+                Assets.Add(FAssetData(LoadedAsset));
+            }
+        }
+    }
 
     TArray<TSharedPtr<FJsonValue>> BlueprintAssets;
     TArray<TSharedPtr<FJsonValue>> ValidationResults;
@@ -946,9 +1313,22 @@ int32 UBlueprintLensCommandlet::Main(const FString& Params)
             continue;
         }
 
-        if (!SingleAsset.IsEmpty() && AssetData.GetObjectPathString() != SingleAsset && AssetData.PackageName.ToString() != SingleAsset)
+        if (ExactAssets.Num() > 0)
         {
-            continue;
+            bool bRequested = false;
+            for (const FString& ExactAsset : ExactAssets)
+            {
+                if (AssetData.GetObjectPathString() == ExactAsset || AssetData.PackageName.ToString() == ExactAsset || AssetData.PackageName.ToString() == BlueprintLens::ToPackageName(ExactAsset))
+                {
+                    bRequested = true;
+                    break;
+                }
+            }
+
+            if (!bRequested)
+            {
+                continue;
+            }
         }
 
         UBlueprint* Blueprint = Cast<UBlueprint>(AssetData.GetAsset());

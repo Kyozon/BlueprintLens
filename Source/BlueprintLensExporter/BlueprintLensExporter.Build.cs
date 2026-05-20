@@ -16,11 +16,15 @@ public class BlueprintLensExporter : ModuleRules
         PrivateDependencyModuleNames.AddRange(new[]
         {
             "AssetRegistry",
+            "AssetTools",
             "BlueprintEditorLibrary",
             "BlueprintGraph",
+            "GameFeatures",
             "Json",
             "JsonUtilities",
             "KismetCompiler",
+            "UMG",
+            "UMGEditor",
             "UnrealEd"
         });
     }

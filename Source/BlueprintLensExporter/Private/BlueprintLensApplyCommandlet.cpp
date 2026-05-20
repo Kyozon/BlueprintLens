@@ -1,13 +1,18 @@
 #include "BlueprintLensCommandlet.h"
 
 #include "BlueprintEditorLibrary.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetToolsModule.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2_Actions.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "GameFeatureAction_AddComponents.h"
+#include "GameFeatureData.h"
 #include "HAL/FileManager.h"
+#include "IAssetTools.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_CustomEvent.h"
@@ -22,16 +27,24 @@
 #include "Misc/PackageName.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
+#include "ObjectTools.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/SavePackage.h"
+#include "WidgetBlueprint.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/PanelWidget.h"
+#include "Components/Widget.h"
 
 namespace BlueprintLensApply
 {
 struct FApplyContext
 {
     TSet<UBlueprint*> ModifiedBlueprints;
+    TSet<UObject*> ModifiedObjects;
     TMap<FString, UEdGraphNode*> NodeAliases;
+    bool bCompileModifiedBlueprints = true;
+    bool bSaveModifiedPackages = true;
 };
 
 static bool ReadStringField(const TSharedPtr<FJsonObject>& Object, const FString& FieldName, FString& OutValue, FString& OutError)
@@ -61,6 +74,27 @@ static FString ToObjectPath(const FString& AssetPath)
     return AssetPath + TEXT(".") + AssetName;
 }
 
+static bool SplitAssetPath(const FString& AssetPath, FString& OutPackagePath, FString& OutAssetName, FString& OutError)
+{
+    FString PackagePath = AssetPath;
+    if (PackagePath.Contains(TEXT(".")))
+    {
+        PackagePath.Split(TEXT("."), &PackagePath, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+    }
+
+    if (!PackagePath.StartsWith(TEXT("/")) || !PackagePath.Split(TEXT("/"), &OutPackagePath, &OutAssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd) || OutPackagePath.IsEmpty() || OutAssetName.IsEmpty())
+    {
+        OutError = FString::Printf(TEXT("Invalid asset path '%s'. Expected '/Root/Folder/AssetName'."), *AssetPath);
+        return false;
+    }
+
+    if (!OutPackagePath.StartsWith(TEXT("/")))
+    {
+        OutPackagePath = TEXT("/") + OutPackagePath;
+    }
+    return true;
+}
+
 static UClass* ResolveClass(const FString& ClassPath)
 {
     if (ClassPath.IsEmpty())
@@ -87,6 +121,37 @@ static UClass* ResolveClass(const FString& ClassPath)
 static UBlueprint* LoadBlueprint(const FString& AssetPath)
 {
     return LoadObject<UBlueprint>(nullptr, *ToObjectPath(AssetPath));
+}
+
+static UObject* LoadAssetObject(const FString& AssetPath)
+{
+    return LoadObject<UObject>(nullptr, *ToObjectPath(AssetPath));
+}
+
+static bool ImportPropertyValue(UObject* Object, const FString& PropertyName, const FString& Value, FString& OutError)
+{
+    if (!Object)
+    {
+        OutError = TEXT("Cannot set property on a null object.");
+        return false;
+    }
+
+    FProperty* Property = Object->GetClass()->FindPropertyByName(*PropertyName);
+    if (!Property)
+    {
+        OutError = FString::Printf(TEXT("Could not find property '%s' on '%s' (%s)."), *PropertyName, *Object->GetPathName(), *Object->GetClass()->GetPathName());
+        return false;
+    }
+
+    Object->Modify();
+    const TCHAR* Result = Property->ImportText_Direct(*Value, Property->ContainerPtrToValuePtr<void>(Object), Object, PPF_None);
+    if (!Result)
+    {
+        OutError = FString::Printf(TEXT("Failed to import value '%s' for property '%s' on '%s'."), *Value, *PropertyName, *Object->GetPathName());
+        return false;
+    }
+
+    return true;
 }
 
 static UEdGraph* FindGraph(UBlueprint* Blueprint, const FString& GraphName)
@@ -148,6 +213,13 @@ static double ReadNumberField(const TSharedPtr<FJsonObject>& Object, const FStri
 {
     double Value = DefaultValue;
     Object->TryGetNumberField(FieldName, Value);
+    return Value;
+}
+
+static bool ReadBoolField(const TSharedPtr<FJsonObject>& Object, const FString& FieldName, const bool DefaultValue)
+{
+    bool Value = DefaultValue;
+    Object->TryGetBoolField(FieldName, Value);
     return Value;
 }
 
@@ -383,6 +455,269 @@ static bool ApplyCreateBlueprint(const TSharedPtr<FJsonObject>& Operation, FAppl
     }
 
     Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
+static bool ApplyDuplicateAsset(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString SourcePath;
+    FString DestinationPath;
+    if (!ReadStringField(Operation, TEXT("source"), SourcePath, OutError) ||
+        !ReadStringField(Operation, TEXT("destination"), DestinationPath, OutError))
+    {
+        return false;
+    }
+
+    const bool bReplaceExisting = ReadBoolField(Operation, TEXT("replaceExisting"), false);
+    const bool bAllowExisting = ReadBoolField(Operation, TEXT("allowExisting"), false);
+
+    UObject* ExistingDestination = LoadAssetObject(DestinationPath);
+    if (ExistingDestination && !bReplaceExisting)
+    {
+        if (bAllowExisting)
+        {
+            Context.ModifiedObjects.Add(ExistingDestination);
+            if (UBlueprint* ExistingBlueprint = Cast<UBlueprint>(ExistingDestination))
+            {
+                Context.ModifiedBlueprints.Add(ExistingBlueprint);
+            }
+            return true;
+        }
+
+        OutError = FString::Printf(TEXT("Asset already exists at '%s'."), *DestinationPath);
+        return false;
+    }
+
+    UObject* SourceObject = LoadAssetObject(SourcePath);
+    if (!SourceObject)
+    {
+        OutError = FString::Printf(TEXT("Could not load source asset '%s'."), *SourcePath);
+        return false;
+    }
+
+    if (ExistingDestination && bReplaceExisting)
+    {
+        TArray<FAssetData> AssetsToDelete;
+        AssetsToDelete.Add(FAssetData(ExistingDestination));
+        if (ObjectTools::DeleteAssets(AssetsToDelete, false) == 0)
+        {
+            OutError = FString::Printf(TEXT("Failed to delete existing asset '%s'."), *DestinationPath);
+            return false;
+        }
+    }
+
+    FString PackagePath;
+    FString AssetName;
+    if (!SplitAssetPath(DestinationPath, PackagePath, AssetName, OutError))
+    {
+        return false;
+    }
+
+    IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+    UObject* DuplicatedObject = AssetTools.DuplicateAsset(AssetName, PackagePath, SourceObject);
+    if (!DuplicatedObject)
+    {
+        OutError = FString::Printf(TEXT("Failed to duplicate '%s' to '%s'."), *SourcePath, *DestinationPath);
+        return false;
+    }
+
+    Context.ModifiedObjects.Add(DuplicatedObject);
+    if (UBlueprint* Blueprint = Cast<UBlueprint>(DuplicatedObject))
+    {
+        Context.ModifiedBlueprints.Add(Blueprint);
+    }
+    return true;
+}
+
+static bool ApplySetBlueprintCdoProperty(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString PropertyName;
+    FString Value;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("property"), PropertyName, OutError) ||
+        !ReadStringField(Operation, TEXT("value"), Value, OutError))
+    {
+        return false;
+    }
+
+    UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+    if (!Blueprint || !Blueprint->GeneratedClass)
+    {
+        OutError = FString::Printf(TEXT("Could not load generated Blueprint class for '%s'."), *AssetPath);
+        return false;
+    }
+
+    UObject* DefaultObject = Blueprint->GeneratedClass->GetDefaultObject(false);
+    if (!ImportPropertyValue(DefaultObject, PropertyName, Value, OutError))
+    {
+        return false;
+    }
+
+    Blueprint->Modify();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    Context.ModifiedBlueprints.Add(Blueprint);
+    return true;
+}
+
+static bool ApplyAddGameFeatureComponentEntry(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString ActorClassPath;
+    FString ComponentClassPath;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("actorClass"), ActorClassPath, OutError) ||
+        !ReadStringField(Operation, TEXT("componentClass"), ComponentClassPath, OutError))
+    {
+        return false;
+    }
+
+    UGameFeatureData* GameFeatureData = Cast<UGameFeatureData>(LoadAssetObject(AssetPath));
+    if (!GameFeatureData)
+    {
+        OutError = FString::Printf(TEXT("Could not load GameFeatureData '%s'."), *AssetPath);
+        return false;
+    }
+
+    UClass* ActorClass = ResolveClass(ActorClassPath);
+    UClass* ComponentClass = ResolveClass(ComponentClassPath);
+    if (!ActorClass || !ComponentClass)
+    {
+        OutError = FString::Printf(TEXT("Could not resolve actor/component class '%s' -> '%s'."), *ActorClassPath, *ComponentClassPath);
+        return false;
+    }
+
+    UGameFeatureAction_AddComponents* AddComponentsAction = nullptr;
+    for (UGameFeatureAction* Action : GameFeatureData->GetMutableActionsInEditor())
+    {
+        AddComponentsAction = Cast<UGameFeatureAction_AddComponents>(Action);
+        if (AddComponentsAction)
+        {
+            break;
+        }
+    }
+
+    if (!AddComponentsAction)
+    {
+        OutError = FString::Printf(TEXT("GameFeatureData '%s' has no GameFeatureAction_AddComponents."), *AssetPath);
+        return false;
+    }
+
+    const bool bAllowExisting = ReadBoolField(Operation, TEXT("allowExisting"), true);
+    for (const FGameFeatureComponentEntry& Entry : AddComponentsAction->ComponentList)
+    {
+        if (Entry.ActorClass.ToSoftObjectPath().ToString() == ActorClass->GetPathName() && Entry.ComponentClass.ToSoftObjectPath().ToString() == ComponentClass->GetPathName())
+        {
+            if (bAllowExisting)
+            {
+                return true;
+            }
+
+            OutError = FString::Printf(TEXT("Component entry already exists on '%s': '%s' -> '%s'."), *AssetPath, *ActorClassPath, *ComponentClassPath);
+            return false;
+        }
+    }
+
+    FGameFeatureComponentEntry& NewEntry = AddComponentsAction->ComponentList.AddDefaulted_GetRef();
+    NewEntry.ActorClass = ActorClass;
+    NewEntry.ComponentClass = ComponentClass;
+    NewEntry.bClientComponent = ReadBoolField(Operation, TEXT("client"), true);
+    NewEntry.bServerComponent = ReadBoolField(Operation, TEXT("server"), false);
+    NewEntry.AdditionFlags = static_cast<uint8>(ReadNumberField(Operation, TEXT("additionFlags"), 0));
+
+    GameFeatureData->Modify();
+    AddComponentsAction->Modify();
+    Context.ModifiedObjects.Add(GameFeatureData);
+    return true;
+}
+
+static bool ApplyReplaceWidgetChild(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString ExistingWidgetName;
+    FString NewWidgetName;
+    FString WidgetClassPath;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("existingWidget"), ExistingWidgetName, OutError) ||
+        !ReadStringField(Operation, TEXT("newWidget"), NewWidgetName, OutError) ||
+        !ReadStringField(Operation, TEXT("widgetClass"), WidgetClassPath, OutError))
+    {
+        return false;
+    }
+
+    UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(LoadBlueprint(AssetPath));
+    if (!WidgetBlueprint || !WidgetBlueprint->WidgetTree)
+    {
+        OutError = FString::Printf(TEXT("Could not load WidgetBlueprint '%s' or its widget tree."), *AssetPath);
+        return false;
+    }
+
+    UClass* WidgetClass = ResolveClass(WidgetClassPath);
+    if (!WidgetClass || !WidgetClass->IsChildOf(UWidget::StaticClass()))
+    {
+        OutError = FString::Printf(TEXT("Could not resolve widget class '%s'."), *WidgetClassPath);
+        return false;
+    }
+
+    if (UWidget* ExistingReplacement = WidgetBlueprint->WidgetTree->FindWidget(*NewWidgetName))
+    {
+        if (ExistingReplacement->GetClass() == WidgetClass || ExistingReplacement->GetClass()->IsChildOf(WidgetClass))
+        {
+            return true;
+        }
+    }
+
+    UWidget* ExistingWidget = WidgetBlueprint->WidgetTree->FindWidget(*ExistingWidgetName);
+    if (!ExistingWidget)
+    {
+        OutError = FString::Printf(TEXT("Could not find widget '%s' in '%s'."), *ExistingWidgetName, *AssetPath);
+        return false;
+    }
+
+    const FName ExistingWidgetFName = ExistingWidget->GetFName();
+    const FName NewWidgetFName(*NewWidgetName);
+    const bool bWasVariable = ExistingWidget->bIsVariable;
+    FGuid WidgetGuid;
+    if (const FGuid* ExistingGuid = WidgetBlueprint->WidgetVariableNameToGuidMap.Find(ExistingWidgetFName))
+    {
+        WidgetGuid = *ExistingGuid;
+    }
+    if (!WidgetGuid.IsValid())
+    {
+        WidgetGuid = FGuid::NewGuid();
+    }
+
+    int32 ChildIndex = INDEX_NONE;
+    UPanelWidget* ParentWidget = UWidgetTree::FindWidgetParent(ExistingWidget, ChildIndex);
+    if (!ParentWidget || ChildIndex == INDEX_NONE)
+    {
+        OutError = FString::Printf(TEXT("Could not find parent panel for widget '%s' in '%s'."), *ExistingWidgetName, *AssetPath);
+        return false;
+    }
+
+    UWidget* NewWidget = WidgetBlueprint->WidgetTree->ConstructWidget<UWidget>(WidgetClass, *NewWidgetName);
+    if (!NewWidget)
+    {
+        OutError = FString::Printf(TEXT("Failed to construct widget '%s' of class '%s'."), *NewWidgetName, *WidgetClassPath);
+        return false;
+    }
+
+    NewWidget->bIsVariable = bWasVariable;
+
+    WidgetBlueprint->Modify();
+    ParentWidget->Modify();
+    ExistingWidget->Modify();
+    NewWidget->Modify();
+    WidgetBlueprint->WidgetVariableNameToGuidMap.Remove(ExistingWidgetFName);
+    WidgetBlueprint->WidgetVariableNameToGuidMap.Add(NewWidgetFName, WidgetGuid);
+    if (!ParentWidget->ReplaceChildAt(ChildIndex, NewWidget))
+    {
+        OutError = FString::Printf(TEXT("Failed to replace widget '%s' in '%s'."), *ExistingWidgetName, *AssetPath);
+        return false;
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WidgetBlueprint);
+    Context.ModifiedBlueprints.Add(WidgetBlueprint);
     return true;
 }
 
@@ -841,7 +1176,60 @@ static bool ApplySetPinDefault(const TSharedPtr<FJsonObject>& Operation, FApplyC
     }
 
     Pin->DefaultValue = Value;
+    if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Text)
+    {
+        Pin->DefaultTextValue = FText::FromString(Value);
+    }
     MarkNodeBlueprintModified(Node, Context);
+    return true;
+}
+
+static bool ApplySetWidgetProperty(const TSharedPtr<FJsonObject>& Operation, FApplyContext& Context, FString& OutError)
+{
+    FString AssetPath;
+    FString WidgetName;
+    FString PropertyName;
+    FString Value;
+    if (!ReadStringField(Operation, TEXT("asset"), AssetPath, OutError) ||
+        !ReadStringField(Operation, TEXT("widget"), WidgetName, OutError) ||
+        !ReadStringField(Operation, TEXT("property"), PropertyName, OutError) ||
+        !ReadStringField(Operation, TEXT("value"), Value, OutError))
+    {
+        return false;
+    }
+
+    UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(LoadBlueprint(AssetPath));
+    if (!WidgetBlueprint || !WidgetBlueprint->WidgetTree)
+    {
+        OutError = FString::Printf(TEXT("Could not load WidgetBlueprint '%s' or its widget tree."), *AssetPath);
+        return false;
+    }
+
+    UWidget* Widget = WidgetBlueprint->WidgetTree->FindWidget(*WidgetName);
+    if (!Widget)
+    {
+        OutError = FString::Printf(TEXT("Could not find widget '%s' in '%s'."), *WidgetName, *AssetPath);
+        return false;
+    }
+
+    FProperty* Property = Widget->GetClass()->FindPropertyByName(*PropertyName);
+    if (!Property)
+    {
+        OutError = FString::Printf(TEXT("Could not find property '%s' on widget '%s' (%s)."), *PropertyName, *WidgetName, *Widget->GetClass()->GetPathName());
+        return false;
+    }
+
+    WidgetBlueprint->Modify();
+    Widget->Modify();
+    const TCHAR* Result = Property->ImportText_Direct(*Value, Property->ContainerPtrToValuePtr<void>(Widget), Widget, PPF_None);
+    if (!Result)
+    {
+        OutError = FString::Printf(TEXT("Failed to import value '%s' for property '%s' on widget '%s'."), *Value, *PropertyName, *WidgetName);
+        return false;
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WidgetBlueprint);
+    Context.ModifiedBlueprints.Add(WidgetBlueprint);
     return true;
 }
 
@@ -1088,6 +1476,18 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
     }
 
     BlueprintLensApply::FApplyContext Context;
+    Context.bCompileModifiedBlueprints = !FParse::Param(*Params, TEXT("NoCompile"));
+    Context.bSaveModifiedPackages = !FParse::Param(*Params, TEXT("NoSave"));
+    bool bCompileFromPatch = Context.bCompileModifiedBlueprints;
+    if (Root->TryGetBoolField(TEXT("compile"), bCompileFromPatch))
+    {
+        Context.bCompileModifiedBlueprints = bCompileFromPatch;
+    }
+    bool bSaveFromPatch = Context.bSaveModifiedPackages;
+    if (Root->TryGetBoolField(TEXT("save"), bSaveFromPatch))
+    {
+        Context.bSaveModifiedPackages = bSaveFromPatch;
+    }
     int32 AppliedCount = 0;
 
     for (int32 Index = 0; Index < Operations->Num(); ++Index)
@@ -1111,6 +1511,22 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
         if (Op == TEXT("create_blueprint"))
         {
             bSuccess = BlueprintLensApply::ApplyCreateBlueprint(Operation, Context, Error);
+        }
+        else if (Op == TEXT("duplicate_asset"))
+        {
+            bSuccess = BlueprintLensApply::ApplyDuplicateAsset(Operation, Context, Error);
+        }
+        else if (Op == TEXT("set_blueprint_cdo_property"))
+        {
+            bSuccess = BlueprintLensApply::ApplySetBlueprintCdoProperty(Operation, Context, Error);
+        }
+        else if (Op == TEXT("add_game_feature_component_entry"))
+        {
+            bSuccess = BlueprintLensApply::ApplyAddGameFeatureComponentEntry(Operation, Context, Error);
+        }
+        else if (Op == TEXT("replace_widget_child"))
+        {
+            bSuccess = BlueprintLensApply::ApplyReplaceWidgetChild(Operation, Context, Error);
         }
         else if (Op == TEXT("add_variable"))
         {
@@ -1151,6 +1567,10 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
         else if (Op == TEXT("set_pin_default"))
         {
             bSuccess = BlueprintLensApply::ApplySetPinDefault(Operation, Context, Error);
+        }
+        else if (Op == TEXT("set_widget_property"))
+        {
+            bSuccess = BlueprintLensApply::ApplySetWidgetProperty(Operation, Context, Error);
         }
         else if (Op == TEXT("connect_pins"))
         {
@@ -1194,18 +1614,36 @@ int32 UBlueprintLensApplyCommandlet::Main(const FString& Params)
         ++AppliedCount;
     }
 
-    for (UBlueprint* Blueprint : Context.ModifiedBlueprints)
+    if (Context.bCompileModifiedBlueprints)
     {
-        FKismetEditorUtilities::CompileBlueprint(Blueprint);
-
-        FString Error;
-        if (!BlueprintLensApply::SavePackageForObject(Blueprint, Error))
+        for (UBlueprint* Blueprint : Context.ModifiedBlueprints)
         {
-            UE_LOG(LogTemp, Error, TEXT("%s"), *Error);
-            return 1;
+            if (Blueprint)
+            {
+                FKismetEditorUtilities::CompileBlueprint(Blueprint);
+            }
         }
     }
 
-    UE_LOG(LogTemp, Display, TEXT("BlueprintLensApply applied %d operations and saved %d Blueprint packages."), AppliedCount, Context.ModifiedBlueprints.Num());
+    if (Context.bSaveModifiedPackages)
+    {
+        TSet<UObject*> ObjectsToSave = Context.ModifiedObjects;
+        for (UBlueprint* Blueprint : Context.ModifiedBlueprints)
+        {
+            ObjectsToSave.Add(Blueprint);
+        }
+
+        for (UObject* Object : ObjectsToSave)
+        {
+            FString Error;
+            if (!BlueprintLensApply::SavePackageForObject(Object, Error))
+            {
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Error);
+                return 1;
+            }
+        }
+    }
+
+    UE_LOG(LogTemp, Display, TEXT("BlueprintLensApply applied %d operations, touched %d Blueprint assets and %d non-Blueprint assets."), AppliedCount, Context.ModifiedBlueprints.Num(), Context.ModifiedObjects.Num());
     return 0;
 }
